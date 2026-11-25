@@ -1,6 +1,7 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::fmt::{self, Debug, Formatter};
+use core::mem;
 
 use aws_lc_rs::aead::{self, Aad, LessSafeKey, NONCE_LEN, Nonce, UnboundKey};
 use aws_lc_rs::agreement;
@@ -14,7 +15,7 @@ use rustls::crypto::hpke::{
 };
 use rustls::crypto::tls13::{HkdfExpander, HkdfPrkExtract, HkdfUsingHmac, expand};
 use rustls::error::{Error, OtherError};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::hmac::{HMAC_SHA256, HMAC_SHA384, HMAC_SHA512};
 use crate::unspecified_err;
@@ -449,12 +450,17 @@ impl<const KEY_SIZE: usize, const KDF_SIZE: usize> HpkeSealer for Sealer<KEY_SIZ
             .increment_seq_num()
             .map_err(unspecified_err)?;
 
-        let mut in_out_buffer = Vec::from(plaintext);
+        // Reserve room for the tag up front: growing the buffer would leave an unwiped copy of
+        // the plaintext behind.
+        let mut in_out_buffer = Zeroizing::new(Vec::with_capacity(
+            plaintext.len() + self.key_schedule.aead.tag_len(),
+        ));
+        in_out_buffer.extend_from_slice(plaintext);
         sealing_key
-            .seal_in_place_append_tag(nonce, Aad::from(aad), &mut in_out_buffer)
+            .seal_in_place_append_tag(nonce, Aad::from(aad), &mut *in_out_buffer)
             .map_err(unspecified_err)?;
 
-        Ok(in_out_buffer)
+        Ok(mem::take(&mut *in_out_buffer))
     }
 }
 
@@ -503,19 +509,21 @@ impl<const KEY_SIZE: usize, const KDF_SIZE: usize> HpkeOpener for Opener<KEY_SIZ
             .map_err(unspecified_err)?;
         let opening_key = LessSafeKey::new(key);
 
-        let mut in_out_buffer = Vec::from(ciphertext);
-        let plaintext = opening_key
+        let mut in_out_buffer = Zeroizing::new(Vec::from(ciphertext));
+        let plaintext_len = opening_key
             .open_in_place(
                 self.key_schedule.compute_nonce(),
                 Aad::from(aad),
                 &mut in_out_buffer,
             )
-            .map_err(unspecified_err)?;
+            .map_err(unspecified_err)?
+            .len();
         self.key_schedule
             .increment_seq_num()
             .map_err(unspecified_err)?;
 
-        Ok(plaintext.to_vec())
+        in_out_buffer.truncate(plaintext_len);
+        Ok(mem::take(&mut *in_out_buffer))
     }
 }
 
@@ -846,7 +854,8 @@ fn labeled_extract_for_expand(
     //   labeled_ikm = concat("HPKE-v1", suite_id, label, ikm)
     //   return Extract(salt, labeled_ikm)
 
-    let labeled_ikm = [&b"HPKE-v1"[..], &suite_id.encoded(), label.as_ref(), ikm].concat();
+    let labeled_ikm =
+        Zeroizing::new([&b"HPKE-v1"[..], &suite_id.encoded(), label.as_ref(), ikm].concat());
     hkdf.extract_from_secret(salt, &labeled_ikm)
 }
 
